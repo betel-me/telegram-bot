@@ -1,0 +1,4 @@
+python-telegram-bot==21.0
+yt-dlp==2024.4.9
+deep-translator==1.11.4
+python-dotenv==1.0.0
