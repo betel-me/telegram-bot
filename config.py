@@ -13,8 +13,11 @@ if not BOT_TOKEN:
         "Get a token from @BotFather on Telegram."
     )
 
-# Optional: OpenAI/GPT key for smarter word extraction (Phase 4 - not required for MVP)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+# Required for AI-based translation (services/ai_translator.py)
+# Get a key from https://console.anthropic.com
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+if not ANTHROPIC_API_KEY:
+    print("⚠️  WARNING: ANTHROPIC_API_KEY not set in .env — AI translation will fail.")
 
 # Free tier limits
 FREE_DAILY_VIDEO_LIMIT = 2
