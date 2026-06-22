@@ -5,7 +5,8 @@ from telegram import Update
 from telegram.ext import ContextTypes
 from services.subtitle_fetcher import get_subtitles
 from services.segment_processor import split_into_segments
-from services.ai_translator import process_all_segments
+from services.word_extractor import extract_keywords, find_example_sentences
+from services.translator import translate_batch
 from database.db import save_video_data, get_cached_video, get_user
 
 logger = logging.getLogger(__name__)
@@ -34,8 +35,9 @@ async def process_video(url, user_id, update, context, status_msg):
             await status_msg.edit_text("⚠️ Please complete /register first.")
             return
 
-        target_lang = user.get('target_lang', 'de')   # language being learned
-        native_lang = user.get('native_lang', 'am')    # language to translate into
+        user_level = user.get('cefr_level', 'B1')
+        target_lang = user.get('target_lang', 'de')    # language being learned
+        native_lang = user.get('native_lang', 'am')     # language to translate into
 
         # --- Fetch subtitles ---
         await status_msg.edit_text("📥 Fetching subtitles...")
@@ -50,30 +52,79 @@ async def process_video(url, user_id, update, context, status_msg):
         # --- Split into 2-minute chunks ---
         segments = split_into_segments(subtitles, segment_length=120)
         total_segments = len(segments)
-        segment_texts = [' '.join(seg['lines']) for seg in segments]
 
+        await status_msg.edit_text(f"📊 Found {total_segments} segments. Selecting key vocabulary...")
+
+        # --- Step 1: extract smart vocabulary per segment (free, local, no network) ---
+        segment_word_lists = []
+        all_words_to_translate = []
+        all_sentences_to_translate = []
+        all_full_sentences = []  # every line of dialogue, for full transcript translation
+
+        for seg in segments:
+            lines = seg['lines']
+            full_text = ' '.join(lines)
+
+            keyword_results = extract_keywords(full_text, top_n=20, user_level=user_level)
+
+            seg_words = []
+            for kw in keyword_results:
+                word = kw['word']
+                level = kw.get('level', '')
+                examples = find_example_sentences(word, lines, max_examples=2)
+
+                seg_words.append({'word': word, 'level': level, 'examples': examples})
+                all_words_to_translate.append(word)
+                all_sentences_to_translate.extend(examples)
+
+            all_full_sentences.extend(lines)
+            segment_word_lists.append((seg, seg_words, lines))
+
+        # --- Step 2: translate everything in big concurrent batches (free Google Translate) ---
+        unique_word_count = len(set(all_words_to_translate))
         await status_msg.edit_text(
-            f"🤖 Translating {total_segments} segments with AI (running in parallel)..."
+            f"🌍 Translating {unique_word_count} key words and the full transcript "
+            f"({total_segments} segments)... this is free and runs in parallel."
         )
 
-        # --- ONE AI call per segment, up to 5 at once ---
-        ai_results = await process_all_segments(
-            segment_texts,
-            source_lang=used_lang,
-            target_lang=native_lang,
-            words_per_segment=20,
-            max_concurrent=5,
+        word_translations = await asyncio.to_thread(
+            translate_batch, all_words_to_translate, used_lang, native_lang
+        )
+        sentence_translations = await asyncio.to_thread(
+            translate_batch, all_sentences_to_translate, used_lang, native_lang
+        )
+        full_line_translations = await asyncio.to_thread(
+            translate_batch, all_full_sentences, used_lang, native_lang
         )
 
-        # --- Assemble final data ---
+        # --- Step 3: assemble final segment data (no more network calls) ---
         all_segment_data = []
-        for idx, (seg, ai_result) in enumerate(zip(segments, ai_results)):
+        for idx, (seg, seg_words, lines) in enumerate(segment_word_lists):
+            final_words = []
+            for w in seg_words:
+                translation = word_translations.get(w['word'], w['word'])
+                example_translations = [
+                    sentence_translations.get(ex, ex) for ex in w['examples']
+                ]
+                final_words.append({
+                    'word': w['word'],
+                    'level': w['level'],
+                    'meaning': translation,
+                    'examples': w['examples'],
+                    'example_translations': example_translations,
+                })
+
+            translation_pairs = [
+                {'source': line, 'target': full_line_translations.get(line, line)}
+                for line in lines
+            ]
+
             all_segment_data.append({
                 'index': idx,
                 'start': seg['start'],
                 'end': seg['end'],
-                'translation': ai_result.get('translation', []),
-                'vocabulary': ai_result.get('vocabulary', []),
+                'translation': translation_pairs,
+                'vocabulary': final_words,
             })
 
         await status_msg.edit_text("💾 Saving...")
@@ -88,9 +139,6 @@ async def process_video(url, user_id, update, context, status_msg):
 
 
 async def send_results(video_data, user_id, context):
-    """Send the original-language transcript + vocab as a downloadable file,
-    plus the first segment inline with Next buttons."""
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     import io
 
     segments = video_data['segments']
@@ -120,19 +168,15 @@ async def send_results(video_data, user_id, context):
 def build_nav_keyboard(video_id, current_index, total_segments):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-    buttons = []
     row = []
     if current_index > 0:
         row.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"seg_{video_id}_{current_index - 1}"))
     if current_index < total_segments - 1:
         row.append(InlineKeyboardButton("➡️ Next Segment", callback_data=f"seg_{video_id}_{current_index + 1}"))
-    if row:
-        buttons.append(row)
-    return InlineKeyboardMarkup(buttons) if buttons else None
+    return InlineKeyboardMarkup([row]) if row else None
 
 
 async def handle_segment_navigation(update, context):
-    """Handles the Next/Previous segment inline button presses."""
     from database.db import get_cached_video
 
     query = update.callback_query
@@ -172,8 +216,9 @@ def build_full_text_file(video_data):
 
         lines.append("### Translation\n")
         for pair in seg['translation']:
-            lines.append(f"{pair.get('source','')}")
-            lines.append(f"{pair.get('target','')}\n")
+            lines.append(pair.get('source', ''))
+            lines.append(pair.get('target', ''))
+            lines.append("")
 
         lines.append("### Vocabulary\n")
         lines.append("| # | Word | Meaning |")
@@ -190,7 +235,8 @@ def format_segment(seg):
     text = f"<b>📚 Segment {seg['index']+1} ({mins_start}-{mins_end} min)</b>\n\n"
     text += "<b>Vocabulary:</b>\n"
     for i, v in enumerate(seg['vocabulary'][:20], 1):
-        text += f"{i}. <b>{v.get('word','')}</b> → {v.get('meaning','')}\n"
+        level_tag = f" <code>{v.get('level','')}</code>" if v.get('level') else ""
+        text += f"{i}. <b>{v.get('word','')}</b>{level_tag} → {v.get('meaning','')}\n"
     return text
 
 
